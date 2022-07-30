@@ -165,14 +165,31 @@ fn parse_time_base(
     ))
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+struct WfmUpdate {
+    real_point_offset: u32,
+    tt_offset: f64,
+    frac_sec: f64,
+    gmt_sec: i32,
+}
+
 fn parse_wfm_update(
     data: &[u8],
-) -> nom::IResult<&[u8], (), nom::error::Error<&[u8]>> {
-    let (data, real_pt_offset) = le_u32(data)?;
+) -> nom::IResult<&[u8], WfmUpdate, nom::error::Error<&[u8]>> {
+    let (data, real_point_offset) = le_u32(data)?;
     let (data, tt_offset) = le_f64(data)?;
     let (data, frac_sec) = le_f64(data)?;
     let (data, gmt_sec) = le_i32(data)?;
-    Ok((data, ()))
+    Ok((
+        data,
+        WfmUpdate {
+            real_point_offset,
+            tt_offset,
+            frac_sec,
+            gmt_sec,
+        },
+    ))
 }
 
 #[allow(dead_code)]
@@ -339,7 +356,7 @@ struct Trace {
 /// Parses a `.wfm` file
 ///
 /// See [this specification](https://download.tek.com/manual/Waveform-File-Format-Manual-077022011.pdf)
-/// for details on the fileformat.
+/// for details on the file format.
 fn parse_wfm(
     data_in: &[u8],
 ) -> nom::IResult<&[u8], Trace, nom::error::Error<&[u8]>> {
