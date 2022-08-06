@@ -235,6 +235,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let streams = split_ports(&cgs);
 
+    // Ethernet frame preamble and start frame delimiter
+    const PREAMBLE_SFD: [u8; 8] =
+        [0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0xD5];
+
     for i in 0..4 {
         let pcs = decode(&streams[0]);
         let packets = get_packets(&pcs);
@@ -244,6 +248,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut pcap_out = cap.savefile(&filename)?;
 
         for p in &packets {
+            if !p.starts_with(&PREAMBLE_SFD) {
+                warn!("Skipping packet without preamble: {:?}", p);
+                continue;
+            }
+
             // Use the current time for packet headers
             let t = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -258,7 +267,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let packet = pcap::Packet {
                 header: &packet_header,
-                data: &p[8..],
+                data: &p[PREAMBLE_SFD.len()..],
             };
             pcap_out.write(&packet);
         }
