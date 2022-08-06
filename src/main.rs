@@ -1,6 +1,6 @@
 use anyhow::Result;
 use env_logger::Env;
-use log::info;
+use log::{info, warn};
 use nom::{
     bytes::complete::{tag, take},
     multi::count,
@@ -416,10 +416,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = std::fs::read(filename)?;
 
     let (_, t) = parse_wfm(data.as_slice()).unwrap();
+    info!("Loaded {} samples", t.pts.len());
 
     const QSGMII_CLOCK_RATE: f64 = 5e9;
     const SECS_PER_CLOCK: f64 = 1.0 / QSGMII_CLOCK_RATE;
-    let samples_per_clock = (SECS_PER_CLOCK / t.scale).round() as usize;
 
     let mut crossings = vec![];
     for (i, (a, b)) in t.pts.iter().zip(&t.pts[1..]).enumerate() {
@@ -428,61 +428,257 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     info!("Found {} crossings", crossings.len());
+
+    let samples_per_clock = (SECS_PER_CLOCK / t.scale).round() as usize;
+    info!("Using {} samples per QSGMII clock", samples_per_clock);
+
     let comma_length = samples_per_clock * 4 + samples_per_clock / 2;
     let mut commas = vec![];
     for (a, b) in crossings.iter().zip(&crossings[1..]) {
         if (b - a) >= comma_length {
-            commas.push(*a);
+            // A comma is either 001111 or 110000.  We detected the crossing
+            // at the beginning of the 1111 or 0000 run, so we back up by
+            // two clock periods, then advance by 1/2 clock period to land in
+            // the middle of the bit.
+            let i = a - samples_per_clock * 2 + samples_per_clock / 2;
+            let mut value = 0;
+            for j in 0..6 {
+                value <<= 1;
+                if t.pts[i + j * samples_per_clock] < 0 {
+                    value |= 1;
+                }
+            }
+            if value == 0b110000 || value == 0b001111 {
+                commas.push(*a);
+            }
         }
     }
     info!("Found {} commas", commas.len());
 
-    // the comma is part of 001111_10xx or 110000_01xx, so we back up two clocks
-    // to read the full symbol.
-    let mut iter = commas.iter().peekable();
-    let mut i = 0;
+    // The comma iterator points to the bit transition at the beginning of the
+    // comma codegroup.  Since the comma codegroup is 001111_10xx or
+    // 110000_01xx, we back up two clocks to read the full symbol.
+    let mut iter_comma =
+        commas.iter().map(|i| i - samples_per_clock * 2).peekable();
+
+    // Index at which to sample the data.  We start at a half-cycle offset from
+    // the transition at the beginning of the comma character.
+    let mut i = iter_comma.next().unwrap() + samples_per_clock / 2;
+
+    // The zero-crossing iterator points to clock transitions between 0 and 1,
+    // for clock recovery.
+    let mut iter_cross =
+        crossings.iter().cloned().filter(move |c| *c > i).peekable();
+
+    let mut bit = 0;
     let mut value = 0;
     let mut cgs = vec![];
-    while let Some(comma) = iter.next() {
-        let mut comma: usize = *comma;
-        comma -= samples_per_clock / 2 + samples_per_clock;
-
-        // Re-sync to the next comma at two clock periods before the next comma
-        // crossing, to avoid clock drift.
-        let next = iter.peek().cloned().map(|c| c - 2 * samples_per_clock);
-        while comma < t.pts.len()
-            && next.map(|next| comma < next).unwrap_or(true)
-        {
-            value <<= 1;
-            if t.pts[comma] > 0 {
-                value |= 0;
-            } else {
-                value |= 1;
-            }
-            i += 1;
-            comma += samples_per_clock;
-            if i == 6 {
-                print!("_");
-            } else if i == 10 {
-                let cg = Codegroup::try_from(value).unwrap();
-                println!(" => {:?}", cg);
-                cgs.push(cg);
-                if !matches!(
-                    cg,
-                    Codegroup::D16_2 | Codegroup::K28_1 | Codegroup::K28_5
-                ) {
-                    println!("    HI");
-                }
-                i = 0;
-                value = 0;
+    while i < t.pts.len() {
+        // Resynchronize based on bit transitions
+        if let Some(j) = iter_cross.peek() {
+            if i > *j {
+                i = *j + samples_per_clock / 2;
+                iter_cross.next();
             }
         }
+        // Resynchronize and reset on comma characters
+        if let Some(j) = iter_comma.peek() {
+            if i > *j {
+                i = *j + samples_per_clock / 2;
+                if bit != 0 {
+                    warn!("Off-sync comma character at {j} ({})", cgs.len());
+                }
+                bit = 0;
+                value = 0;
+                iter_comma.next();
+            }
+        }
+
+        value <<= 1;
+        if t.pts[i] > 0 {
+            value |= 0;
+        } else {
+            value |= 1;
+        }
+        bit += 1;
+        i += samples_per_clock;
+        if bit == 10 {
+            let cg = Codegroup::try_from(value).unwrap();
+            cgs.push(cg);
+            bit = 0;
+            value = 0;
+        }
+    }
+
+    // Split the codegroups into separate streams for each channel
+    let mut channel: Option<usize> = None;
+    let mut streams: [Vec<Codegroup>; 4] = Default::default();
+    for (i, cg) in cgs.iter_mut().enumerate() {
+        /*
+        info!("{}: {:?}", i, cg);
+        if i > 100 {
+            panic!();
+        }
+        */
+        // Detect the K28.1 sync character
+        if *cg == Codegroup::K28_1 {
+            if channel.map(|c| c != 0).unwrap_or(false) {
+                warn!("Out of sync K28.1 at codegroup {}", i);
+            }
+            channel = Some(0);
+            *cg = Codegroup::K28_5;
+        }
+        if let Some(c) = channel.as_mut() {
+            streams[*c].push(*cg);
+            *c = (*c + 1) % 4;
+        }
+    }
+
+    // Decode a single channel into packets
+    let mut cg_iter = streams[0].iter().cloned().enumerate();
+    let mut ordered_sets = vec![];
+    while let Some((i, cg)) = cg_iter.next() {
+        // Table 36–3
+        let s = match cg {
+            Codegroup::K28_5 => match read_k28_5(&mut cg_iter) {
+                Some(c) => c,
+                None => break,
+            },
+            Codegroup::K23_7 => OrderedSet::CarrierExtend,
+            Codegroup::K27_7 => OrderedSet::StartOfPacket,
+            Codegroup::K29_7 => OrderedSet::EndOfPacket,
+            Codegroup::K30_7 => OrderedSet::ErrorPropagation,
+            d => {
+                if !d.is_data() {
+                    warn!("Unexpected special codegroup as {i}: {:?}", d);
+                    continue;
+                }
+                OrderedSet::D(d)
+            }
+        };
+        match s {
+            OrderedSet::Idle | OrderedSet::D(..) => (),
+            s => info!("{:?}", s),
+        }
+        ordered_sets.push(s);
+    }
+
+    let mut packet = vec![];
+    let mut packets: Vec<Vec<u8>> = vec![];
+    for (i, o) in ordered_sets.iter().enumerate() {
+        let packet_done = match o {
+            OrderedSet::StartOfPacket => {
+                if !packet.is_empty() {
+                    warn!("Got /S/ without /T/ at ordered set {i}");
+                }
+                true
+            }
+            OrderedSet::EndOfPacket => {
+                if packet.is_empty() {
+                    warn!("Got /T/ with an empty packet at ordered set {i}");
+                }
+                true
+            }
+            OrderedSet::D(d) => {
+                packet.push(u8::from(*d));
+                false
+            }
+            _ => false,
+        };
+        if packet_done {
+            let p: Vec<u8> = packet.drain(..).step_by(10).collect();
+            if p.len() < 8 {
+                warn!("Skipping short packet {:?}", p);
+            } else {
+                packets.push(p);
+            }
+            packet.clear();
+        }
+    }
+    if !packet.is_empty() {
+        info!("Discarding {} code-groups of partial packet", packet.len());
+    }
+    for p in packets {
+        for b in p {
+            print!("{:02x} ", b);
+        }
+        println!();
     }
 
     Ok(())
 }
 
-#[derive(Copy, Clone, Debug)]
+/// Reads the data that follows a K28.5 codegroup, forming an ordered set
+///
+/// Returns `None` if the stream terminates.
+fn read_k28_5(
+    mut iter: impl Iterator<Item = (usize, Codegroup)>,
+) -> Option<OrderedSet> {
+    let out = match iter.next()? {
+        (_, Codegroup::D21_5 | Codegroup::D2_2) => {
+            let (j1, d1) = iter.next()?;
+            let (j2, d2) = iter.next()?;
+            if !d1.is_data() {
+                warn!("Unexpected special codegroup at {j1}: {:?}", d1);
+            }
+            if !d2.is_data() {
+                warn!("Unexpected special codegroup at {j2}: {:?}", d2);
+            }
+            OrderedSet::Configuration(d1, d2)
+        }
+
+        (_, Codegroup::D5_6 | Codegroup::D16_2) => OrderedSet::Idle,
+        (_, Codegroup::D6_5 | Codegroup::D26_4) => OrderedSet::LinkPartnerIdle,
+        (j, c) => {
+            // "A received ordered set that consists of two
+            //  code-groups, the first of which is /K28.5/ and the
+            //  second of which is a data code-group other than
+            //  /D21.5/ or /D2.2/ (or /D6.5/ or /D26.4/ to support
+            //  EEE capability), is treated as an /I/ ordered set."
+            //  [36.2.4.12]
+            warn!("Unexpected codegroup after K28.5 at {j}: {:?}", c);
+            OrderedSet::Idle
+        }
+    };
+    Some(out)
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum OrderedSet {
+    /// Configuration
+    Configuration(Codegroup, Codegroup),
+    /// Idle
+    Idle,
+    /// Carrier extend
+    CarrierExtend,
+    /// Start of packet
+    StartOfPacket,
+    /// End of packet
+    EndOfPacket,
+    /// Error propagation
+    ErrorPropagation,
+    /// Link partner idle 1
+    LinkPartnerIdle,
+    /// Data
+    D(Codegroup),
+}
+
+impl std::fmt::Debug for OrderedSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(a, b) => write!(f, "/C/{:?}/{:?}/", a, b),
+            Self::Idle => write!(f, "/I/"),
+            Self::CarrierExtend => write!(f, "/R/"),
+            Self::StartOfPacket => write!(f, "/S/"),
+            Self::EndOfPacket => write!(f, "/T/"),
+            Self::ErrorPropagation => write!(f, "/V/"),
+            Self::LinkPartnerIdle => write!(f, "/LI/"),
+            Self::D(d) => write!(f, "{:?}", d),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
 enum Codegroup {
     D0_0,
     D1_0,
@@ -752,6 +948,326 @@ enum Codegroup {
     K27_7,
     K29_7,
     K30_7,
+}
+
+impl std::fmt::Debug for Codegroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use Codegroup::*;
+        match self {
+            D0_0 => write!(f, "D0.0"),
+            D1_0 => write!(f, "D1.0"),
+            D2_0 => write!(f, "D2.0"),
+            D3_0 => write!(f, "D3.0"),
+            D4_0 => write!(f, "D4.0"),
+            D5_0 => write!(f, "D5.0"),
+            D6_0 => write!(f, "D6.0"),
+            D7_0 => write!(f, "D7.0"),
+            D8_0 => write!(f, "D8.0"),
+            D9_0 => write!(f, "D9.0"),
+            D10_0 => write!(f, "D10.0"),
+            D11_0 => write!(f, "D11.0"),
+            D12_0 => write!(f, "D12.0"),
+            D13_0 => write!(f, "D13.0"),
+            D14_0 => write!(f, "D14.0"),
+            D15_0 => write!(f, "D15.0"),
+            D16_0 => write!(f, "D16.0"),
+            D17_0 => write!(f, "D17.0"),
+            D18_0 => write!(f, "D18.0"),
+            D19_0 => write!(f, "D19.0"),
+            D20_0 => write!(f, "D20.0"),
+            D21_0 => write!(f, "D21.0"),
+            D22_0 => write!(f, "D22.0"),
+            D23_0 => write!(f, "D23.0"),
+            D24_0 => write!(f, "D24.0"),
+            D25_0 => write!(f, "D25.0"),
+            D26_0 => write!(f, "D26.0"),
+            D27_0 => write!(f, "D27.0"),
+            D28_0 => write!(f, "D28.0"),
+            D29_0 => write!(f, "D29.0"),
+            D30_0 => write!(f, "D30.0"),
+            D31_0 => write!(f, "D31.0"),
+            D0_1 => write!(f, "D0.1"),
+            D1_1 => write!(f, "D1.1"),
+            D2_1 => write!(f, "D2.1"),
+            D3_1 => write!(f, "D3.1"),
+            D4_1 => write!(f, "D4.1"),
+            D5_1 => write!(f, "D5.1"),
+            D6_1 => write!(f, "D6.1"),
+            D7_1 => write!(f, "D7.1"),
+            D8_1 => write!(f, "D8.1"),
+            D9_1 => write!(f, "D9.1"),
+            D10_1 => write!(f, "D10.1"),
+            D11_1 => write!(f, "D11.1"),
+            D12_1 => write!(f, "D12.1"),
+            D13_1 => write!(f, "D13.1"),
+            D14_1 => write!(f, "D14.1"),
+            D15_1 => write!(f, "D15.1"),
+            D16_1 => write!(f, "D16.1"),
+            D17_1 => write!(f, "D17.1"),
+            D18_1 => write!(f, "D18.1"),
+            D19_1 => write!(f, "D19.1"),
+            D20_1 => write!(f, "D20.1"),
+            D21_1 => write!(f, "D21.1"),
+            D22_1 => write!(f, "D22.1"),
+            D23_1 => write!(f, "D23.1"),
+            D24_1 => write!(f, "D24.1"),
+            D25_1 => write!(f, "D25.1"),
+            D26_1 => write!(f, "D26.1"),
+            D27_1 => write!(f, "D27.1"),
+            D28_1 => write!(f, "D28.1"),
+            D29_1 => write!(f, "D29.1"),
+            D30_1 => write!(f, "D30.1"),
+            D31_1 => write!(f, "D31.1"),
+            D0_2 => write!(f, "D0.2"),
+            D1_2 => write!(f, "D1.2"),
+            D2_2 => write!(f, "D2.2"),
+            D3_2 => write!(f, "D3.2"),
+            D4_2 => write!(f, "D4.2"),
+            D5_2 => write!(f, "D5.2"),
+            D6_2 => write!(f, "D6.2"),
+            D7_2 => write!(f, "D7.2"),
+            D8_2 => write!(f, "D8.2"),
+            D9_2 => write!(f, "D9.2"),
+            D10_2 => write!(f, "D10.2"),
+            D11_2 => write!(f, "D11.2"),
+            D12_2 => write!(f, "D12.2"),
+            D13_2 => write!(f, "D13.2"),
+            D14_2 => write!(f, "D14.2"),
+            D15_2 => write!(f, "D15.2"),
+            D16_2 => write!(f, "D16.2"),
+            D17_2 => write!(f, "D17.2"),
+            D18_2 => write!(f, "D18.2"),
+            D19_2 => write!(f, "D19.2"),
+            D20_2 => write!(f, "D20.2"),
+            D21_2 => write!(f, "D21.2"),
+            D22_2 => write!(f, "D22.2"),
+            D23_2 => write!(f, "D23.2"),
+            D24_2 => write!(f, "D24.2"),
+            D25_2 => write!(f, "D25.2"),
+            D26_2 => write!(f, "D26.2"),
+            D27_2 => write!(f, "D27.2"),
+            D28_2 => write!(f, "D28.2"),
+            D29_2 => write!(f, "D29.2"),
+            D30_2 => write!(f, "D30.2"),
+            D31_2 => write!(f, "D31.2"),
+            D0_3 => write!(f, "D0.3"),
+            D1_3 => write!(f, "D1.3"),
+            D2_3 => write!(f, "D2.3"),
+            D3_3 => write!(f, "D3.3"),
+            D4_3 => write!(f, "D4.3"),
+            D5_3 => write!(f, "D5.3"),
+            D6_3 => write!(f, "D6.3"),
+            D7_3 => write!(f, "D7.3"),
+            D8_3 => write!(f, "D8.3"),
+            D9_3 => write!(f, "D9.3"),
+            D10_3 => write!(f, "D10.3"),
+            D11_3 => write!(f, "D11.3"),
+            D12_3 => write!(f, "D12.3"),
+            D13_3 => write!(f, "D13.3"),
+            D14_3 => write!(f, "D14.3"),
+            D15_3 => write!(f, "D15.3"),
+            D16_3 => write!(f, "D16.3"),
+            D17_3 => write!(f, "D17.3"),
+            D18_3 => write!(f, "D18.3"),
+            D19_3 => write!(f, "D19.3"),
+            D20_3 => write!(f, "D20.3"),
+            D21_3 => write!(f, "D21.3"),
+            D22_3 => write!(f, "D22.3"),
+            D23_3 => write!(f, "D23.3"),
+            D24_3 => write!(f, "D24.3"),
+            D25_3 => write!(f, "D25.3"),
+            D26_3 => write!(f, "D26.3"),
+            D27_3 => write!(f, "D27.3"),
+            D28_3 => write!(f, "D28.3"),
+            D29_3 => write!(f, "D29.3"),
+            D30_3 => write!(f, "D30.3"),
+            D31_3 => write!(f, "D31.3"),
+            D0_4 => write!(f, "D0.4"),
+            D1_4 => write!(f, "D1.4"),
+            D2_4 => write!(f, "D2.4"),
+            D3_4 => write!(f, "D3.4"),
+            D4_4 => write!(f, "D4.4"),
+            D5_4 => write!(f, "D5.4"),
+            D6_4 => write!(f, "D6.4"),
+            D7_4 => write!(f, "D7.4"),
+            D8_4 => write!(f, "D8.4"),
+            D9_4 => write!(f, "D9.4"),
+            D10_4 => write!(f, "D10.4"),
+            D11_4 => write!(f, "D11.4"),
+            D12_4 => write!(f, "D12.4"),
+            D13_4 => write!(f, "D13.4"),
+            D14_4 => write!(f, "D14.4"),
+            D15_4 => write!(f, "D15.4"),
+            D16_4 => write!(f, "D16.4"),
+            D17_4 => write!(f, "D17.4"),
+            D18_4 => write!(f, "D18.4"),
+            D19_4 => write!(f, "D19.4"),
+            D20_4 => write!(f, "D20.4"),
+            D21_4 => write!(f, "D21.4"),
+            D22_4 => write!(f, "D22.4"),
+            D23_4 => write!(f, "D23.4"),
+            D24_4 => write!(f, "D24.4"),
+            D25_4 => write!(f, "D25.4"),
+            D26_4 => write!(f, "D26.4"),
+            D27_4 => write!(f, "D27.4"),
+            D28_4 => write!(f, "D28.4"),
+            D29_4 => write!(f, "D29.4"),
+            D30_4 => write!(f, "D30.4"),
+            D31_4 => write!(f, "D31.4"),
+            D0_5 => write!(f, "D0.5"),
+            D1_5 => write!(f, "D1.5"),
+            D2_5 => write!(f, "D2.5"),
+            D3_5 => write!(f, "D3.5"),
+            D4_5 => write!(f, "D4.5"),
+            D5_5 => write!(f, "D5.5"),
+            D6_5 => write!(f, "D6.5"),
+            D7_5 => write!(f, "D7.5"),
+            D8_5 => write!(f, "D8.5"),
+            D9_5 => write!(f, "D9.5"),
+            D10_5 => write!(f, "D10.5"),
+            D11_5 => write!(f, "D11.5"),
+            D12_5 => write!(f, "D12.5"),
+            D13_5 => write!(f, "D13.5"),
+            D14_5 => write!(f, "D14.5"),
+            D15_5 => write!(f, "D15.5"),
+            D16_5 => write!(f, "D16.5"),
+            D17_5 => write!(f, "D17.5"),
+            D18_5 => write!(f, "D18.5"),
+            D19_5 => write!(f, "D19.5"),
+            D20_5 => write!(f, "D20.5"),
+            D21_5 => write!(f, "D21.5"),
+            D22_5 => write!(f, "D22.5"),
+            D23_5 => write!(f, "D23.5"),
+            D24_5 => write!(f, "D24.5"),
+            D25_5 => write!(f, "D25.5"),
+            D26_5 => write!(f, "D26.5"),
+            D27_5 => write!(f, "D27.5"),
+            D28_5 => write!(f, "D28.5"),
+            D29_5 => write!(f, "D29.5"),
+            D30_5 => write!(f, "D30.5"),
+            D31_5 => write!(f, "D31.5"),
+            D0_6 => write!(f, "D0.6"),
+            D1_6 => write!(f, "D1.6"),
+            D2_6 => write!(f, "D2.6"),
+            D3_6 => write!(f, "D3.6"),
+            D4_6 => write!(f, "D4.6"),
+            D5_6 => write!(f, "D5.6"),
+            D6_6 => write!(f, "D6.6"),
+            D7_6 => write!(f, "D7.6"),
+            D8_6 => write!(f, "D8.6"),
+            D9_6 => write!(f, "D9.6"),
+            D10_6 => write!(f, "D10.6"),
+            D11_6 => write!(f, "D11.6"),
+            D12_6 => write!(f, "D12.6"),
+            D13_6 => write!(f, "D13.6"),
+            D14_6 => write!(f, "D14.6"),
+            D15_6 => write!(f, "D15.6"),
+            D16_6 => write!(f, "D16.6"),
+            D17_6 => write!(f, "D17.6"),
+            D18_6 => write!(f, "D18.6"),
+            D19_6 => write!(f, "D19.6"),
+            D20_6 => write!(f, "D20.6"),
+            D21_6 => write!(f, "D21.6"),
+            D22_6 => write!(f, "D22.6"),
+            D23_6 => write!(f, "D23.6"),
+            D24_6 => write!(f, "D24.6"),
+            D25_6 => write!(f, "D25.6"),
+            D26_6 => write!(f, "D26.6"),
+            D27_6 => write!(f, "D27.6"),
+            D28_6 => write!(f, "D28.6"),
+            D29_6 => write!(f, "D29.6"),
+            D30_6 => write!(f, "D30.6"),
+            D31_6 => write!(f, "D31.6"),
+            D0_7 => write!(f, "D0.7"),
+            D1_7 => write!(f, "D1.7"),
+            D2_7 => write!(f, "D2.7"),
+            D3_7 => write!(f, "D3.7"),
+            D4_7 => write!(f, "D4.7"),
+            D5_7 => write!(f, "D5.7"),
+            D6_7 => write!(f, "D6.7"),
+            D7_7 => write!(f, "D7.7"),
+            D8_7 => write!(f, "D8.7"),
+            D9_7 => write!(f, "D9.7"),
+            D10_7 => write!(f, "D10.7"),
+            D11_7 => write!(f, "D11.7"),
+            D12_7 => write!(f, "D12.7"),
+            D13_7 => write!(f, "D13.7"),
+            D14_7 => write!(f, "D14.7"),
+            D15_7 => write!(f, "D15.7"),
+            D16_7 => write!(f, "D16.7"),
+            D17_7 => write!(f, "D17.7"),
+            D18_7 => write!(f, "D18.7"),
+            D19_7 => write!(f, "D19.7"),
+            D20_7 => write!(f, "D20.7"),
+            D21_7 => write!(f, "D21.7"),
+            D22_7 => write!(f, "D22.7"),
+            D23_7 => write!(f, "D23.7"),
+            D24_7 => write!(f, "D24.7"),
+            D25_7 => write!(f, "D25.7"),
+            D26_7 => write!(f, "D26.7"),
+            D27_7 => write!(f, "D27.7"),
+            D28_7 => write!(f, "D28.7"),
+            D29_7 => write!(f, "D29.7"),
+            D30_7 => write!(f, "D30.7"),
+            D31_7 => write!(f, "D31.7"),
+            K28_0 => write!(f, "K28.0"),
+            K28_1 => write!(f, "K28.1"),
+            K28_2 => write!(f, "K28.2"),
+            K28_3 => write!(f, "K28.3"),
+            K28_4 => write!(f, "K28.4"),
+            K28_5 => write!(f, "K28.5"),
+            K28_6 => write!(f, "K28.6"),
+            K28_7 => write!(f, "K28.7"),
+            K23_7 => write!(f, "K23.7"),
+            K27_7 => write!(f, "K27.7"),
+            K29_7 => write!(f, "K29.7"),
+            K30_7 => write!(f, "K30.7"),
+        }
+    }
+}
+
+impl Codegroup {
+    /// Returns `true` if this is a Dx.y code-group
+    fn is_data(&self) -> bool {
+        use Codegroup::*;
+        match self {
+            D0_0 | D1_0 | D2_0 | D3_0 | D4_0 | D5_0 | D6_0 | D7_0 | D8_0
+            | D9_0 | D10_0 | D11_0 | D12_0 | D13_0 | D14_0 | D15_0 | D16_0
+            | D17_0 | D18_0 | D19_0 | D20_0 | D21_0 | D22_0 | D23_0 | D24_0
+            | D25_0 | D26_0 | D27_0 | D28_0 | D29_0 | D30_0 | D31_0 | D0_1
+            | D1_1 | D2_1 | D3_1 | D4_1 | D5_1 | D6_1 | D7_1 | D8_1 | D9_1
+            | D10_1 | D11_1 | D12_1 | D13_1 | D14_1 | D15_1 | D16_1 | D17_1
+            | D18_1 | D19_1 | D20_1 | D21_1 | D22_1 | D23_1 | D24_1 | D25_1
+            | D26_1 | D27_1 | D28_1 | D29_1 | D30_1 | D31_1 | D0_2 | D1_2
+            | D2_2 | D3_2 | D4_2 | D5_2 | D6_2 | D7_2 | D8_2 | D9_2 | D10_2
+            | D11_2 | D12_2 | D13_2 | D14_2 | D15_2 | D16_2 | D17_2 | D18_2
+            | D19_2 | D20_2 | D21_2 | D22_2 | D23_2 | D24_2 | D25_2 | D26_2
+            | D27_2 | D28_2 | D29_2 | D30_2 | D31_2 | D0_3 | D1_3 | D2_3
+            | D3_3 | D4_3 | D5_3 | D6_3 | D7_3 | D8_3 | D9_3 | D10_3
+            | D11_3 | D12_3 | D13_3 | D14_3 | D15_3 | D16_3 | D17_3 | D18_3
+            | D19_3 | D20_3 | D21_3 | D22_3 | D23_3 | D24_3 | D25_3 | D26_3
+            | D27_3 | D28_3 | D29_3 | D30_3 | D31_3 | D0_4 | D1_4 | D2_4
+            | D3_4 | D4_4 | D5_4 | D6_4 | D7_4 | D8_4 | D9_4 | D10_4
+            | D11_4 | D12_4 | D13_4 | D14_4 | D15_4 | D16_4 | D17_4 | D18_4
+            | D19_4 | D20_4 | D21_4 | D22_4 | D23_4 | D24_4 | D25_4 | D26_4
+            | D27_4 | D28_4 | D29_4 | D30_4 | D31_4 | D0_5 | D1_5 | D2_5
+            | D3_5 | D4_5 | D5_5 | D6_5 | D7_5 | D8_5 | D9_5 | D10_5
+            | D11_5 | D12_5 | D13_5 | D14_5 | D15_5 | D16_5 | D17_5 | D18_5
+            | D19_5 | D20_5 | D21_5 | D22_5 | D23_5 | D24_5 | D25_5 | D26_5
+            | D27_5 | D28_5 | D29_5 | D30_5 | D31_5 | D0_6 | D1_6 | D2_6
+            | D3_6 | D4_6 | D5_6 | D6_6 | D7_6 | D8_6 | D9_6 | D10_6
+            | D11_6 | D12_6 | D13_6 | D14_6 | D15_6 | D16_6 | D17_6 | D18_6
+            | D19_6 | D20_6 | D21_6 | D22_6 | D23_6 | D24_6 | D25_6 | D26_6
+            | D27_6 | D28_6 | D29_6 | D30_6 | D31_6 | D0_7 | D1_7 | D2_7
+            | D3_7 | D4_7 | D5_7 | D6_7 | D7_7 | D8_7 | D9_7 | D10_7
+            | D11_7 | D12_7 | D13_7 | D14_7 | D15_7 | D16_7 | D17_7 | D18_7
+            | D19_7 | D20_7 | D21_7 | D22_7 | D23_7 | D24_7 | D25_7 | D26_7
+            | D27_7 | D28_7 | D29_7 | D30_7 | D31_7 => true,
+
+            K28_0 | K28_1 | K28_2 | K28_3 | K28_4 | K28_5 | K28_6 | K28_7
+            | K23_7 | K27_7 | K29_7 | K30_7 => false,
+        }
+    }
 }
 
 impl From<Codegroup> for u8 {
@@ -1029,6 +1545,7 @@ impl From<Codegroup> for u8 {
         }
     }
 }
+
 impl TryFrom<u16> for Codegroup {
     type Error = ();
     fn try_from(value: u16) -> Result<Self, Self::Error> {
