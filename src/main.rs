@@ -130,6 +130,7 @@ fn split_ports(cgs: &[Codegroup]) -> [Vec<Codegroup>; 4] {
     streams
 }
 
+/// Decodes a set of codegroups into PCS-level control and data
 fn decode(cgs: &[Codegroup]) -> Vec<Pcs> {
     // Decode a single channel into packets
     let mut cg_iter = cgs.iter().cloned().enumerate();
@@ -158,6 +159,8 @@ fn decode(cgs: &[Codegroup]) -> Vec<Pcs> {
     pcs
 }
 
+/// Splits a stream of PCS data into individual packets, using `/S/` and `/T/`
+/// ordered sets as delimiters.
 fn get_packets(pcs: &[Pcs]) -> Vec<Vec<u8>> {
     let mut packet = vec![];
     let mut packets: Vec<Vec<u8>> = vec![];
@@ -244,8 +247,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!();
         }
     }
-
-
 
     Ok(())
 }
