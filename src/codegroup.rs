@@ -1,7 +1,7 @@
 /// 8b/10b code-group
 ///
 /// Based on Tables 36-1a,b,c,d,e and 36-2 in 802.3-2015
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Codegroup {
     D0_0,
     D1_0,
@@ -273,7 +273,7 @@ pub enum Codegroup {
     K30_7,
 }
 
-impl std::fmt::Debug for Codegroup {
+impl std::fmt::Display for Codegroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use Codegroup::*;
         match self {

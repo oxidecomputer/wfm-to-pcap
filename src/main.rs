@@ -329,7 +329,7 @@ impl std::fmt::Debug for Pcs {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum OrderedSet {
     /// Configuration
     Configuration(Codegroup, Codegroup),
@@ -347,10 +347,10 @@ enum OrderedSet {
     LinkPartnerIdle,
 }
 
-impl std::fmt::Debug for OrderedSet {
+impl std::fmt::Display for OrderedSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Configuration(a, b) => write!(f, "/C/{:?}/{:?}/", a, b),
+            Self::Configuration(a, b) => write!(f, "/C/{}/{}/", a, b),
             Self::Idle => write!(f, "/I/"),
             Self::CarrierExtend => write!(f, "/R/"),
             Self::StartOfPacket => write!(f, "/S/"),
