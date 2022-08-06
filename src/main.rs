@@ -40,13 +40,13 @@ fn get_commas(
             // 1/2 clock period to land in the middle of the bit.
             let i = a + samples_per_clock / 2;
             let mut value = 0;
-            for j in 0..6 {
+            for j in 0..7 {
                 value <<= 1;
                 if pts[i + j * samples_per_clock] {
                     value |= 1;
                 }
             }
-            value == 0b110000 || value == 0b001111
+            value == 0b1100000 || value == 0b0011111
         })
         .collect()
 }
