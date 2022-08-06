@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use env_logger::Env;
 use log::{info, warn};
 
@@ -238,14 +238,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..4 {
         let pcs = decode(&streams[0]);
         let packets = get_packets(&pcs);
-        println!("Port {}:", i);
-        for p in packets {
-            print!("  ");
-            for b in p {
-                print!("{:02x} ", b);
-            }
-            println!();
+
+        let filename = format!("out.pcap.{}", i);
+        let cap = pcap::Capture::dead(pcap::Linktype::ETHERNET)?;
+        let mut pcap_out = cap.savefile(&filename)?;
+
+        for p in &packets {
+            // Use the current time for packet headers
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .context("Time went backwards")?;
+            let packet_header = pcap::PacketHeader {
+                ts: libc::timeval {
+                    tv_sec: i64::try_from(t.as_secs()).unwrap(),
+                    tv_usec: i32::try_from(t.subsec_micros()).unwrap(),
+                },
+                caplen: u32::try_from(p.len()).unwrap(),
+                len: u32::try_from(p.len()).unwrap(),
+            };
+            let packet = pcap::Packet {
+                header: &packet_header,
+                data: &p[8..],
+            };
+            pcap_out.write(&packet);
         }
+        info!(
+            "Wrote {} packets from port {i} to {filename}",
+            packets.len()
+        );
     }
 
     Ok(())
