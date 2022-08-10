@@ -132,7 +132,6 @@ fn split_ports(cgs: &[Codegroup]) -> [Vec<Codegroup>; 4] {
 
 /// Decodes a set of codegroups into PCS-level control and data
 fn decode(cgs: &[Codegroup]) -> Vec<Pcs> {
-    // Decode a single channel into packets
     let mut cg_iter = cgs.iter().cloned().enumerate();
     let mut pcs = vec![];
     while let Some((i, cg)) = cg_iter.next() {
