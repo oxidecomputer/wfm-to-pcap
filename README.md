@@ -6,3 +6,6 @@ The pipeline includes
 - QSGMII comma detection and code-group extraction
 - Separating code-groups into packets based on special characters
 - Writing a `.pcap` file out
+
+For a detailed write-up, check out
+[this blog post](https://www.mattkeeter.com/blog/2022-08-11-udp/).
