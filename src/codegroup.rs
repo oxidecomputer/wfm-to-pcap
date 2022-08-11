@@ -1,6 +1,10 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 /// 8b/10b code-group
 ///
-/// Based on Tables 36-1a,b,c,d,e and 36-2 in 802.3-2015
+/// Based on Tables 36-1a,b,c,d,e and 36-2 in IEEE 802.3-2015
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Codegroup {
     D0_0,
